@@ -1682,6 +1682,77 @@ mod tests {
         restarted.shutdown();
     }
 
+    fn operator_ctx() -> OperationContext {
+        OperationContext {
+            actor: "test".into(),
+            roles: vec!["owner".into(), "operator".into()],
+            stale_ms: 60_000,
+        }
+    }
+
+    /// Capture an empty component set for a fresh workload and restore it once
+    /// onto the same node, leaving the checkpoint RESTORED.
+    fn restored_checkpoint(coord: &Coordinator, node: &NodeRuntime, ctx: &OperationContext) -> Id {
+        let w = coord
+            .create_workload(&spec(), Some(&node.node_id), ctx)
+            .unwrap();
+        let out = coord
+            .request_capture(
+                &w.workload_id,
+                &crate::capture::CaptureOptions::default(),
+                ctx,
+            )
+            .unwrap();
+        let ckpt_id = out.checkpoint_id.unwrap();
+        let first = coord
+            .request_restore(&ckpt_id, &node.node_id, &RestoreOptions::default(), ctx)
+            .unwrap();
+        assert_eq!(first.workload_generation, Some(1));
+        assert_eq!(
+            coord.checkpoint_get(&ckpt_id).unwrap().unwrap().lifecycle,
+            LifecycleState::Restored
+        );
+        ckpt_id
+    }
+
+    #[test]
+    fn restored_checkpoint_can_be_restored_again() {
+        let (_d1, _d2, _d3, coord, node) = test_harness();
+        let ctx = operator_ctx();
+        let ckpt_id = restored_checkpoint(&coord, &node, &ctx);
+
+        // RESTORED is a restorable state: the same checkpoint restores again
+        // and the workload moves on to its next generation.
+        let second = coord
+            .request_restore(&ckpt_id, &node.node_id, &RestoreOptions::default(), &ctx)
+            .unwrap();
+        assert_eq!(second.workload_generation, Some(2));
+        let ckpt = coord.checkpoint_get(&ckpt_id).unwrap().unwrap();
+        assert_eq!(ckpt.lifecycle, LifecycleState::Restored);
+        assert_eq!(ckpt.restore_count, 2);
+    }
+
+    #[test]
+    fn retiring_a_restored_checkpoint_is_refused_before_any_replica_is_deleted() {
+        let (_d1, _d2, _d3, coord, node) = test_harness();
+        let ctx = operator_ctx();
+        let ckpt_id = restored_checkpoint(&coord, &node, &ctx);
+        coord.unprotect_checkpoint(&ckpt_id, &ctx).unwrap();
+
+        // RESTORED cannot move to RETIRED. The refusal has to come before the
+        // nodes are told to delete their replicas, or the metadata keeps
+        // describing a restorable checkpoint whose bytes are gone.
+        let err = coord.retire_checkpoint(&ckpt_id, &ctx).unwrap_err();
+        assert!(matches!(
+            err,
+            FabricError::InvalidLifecycleTransition { .. }
+        ));
+        let after = coord.checkpoint_get(&ckpt_id).unwrap().unwrap();
+        assert_eq!(after.lifecycle, LifecycleState::Restored);
+        assert_eq!(after.replica_count, 1);
+        assert!(coord.verify_checkpoint(&ckpt_id, &ctx).unwrap().ok);
+    }
+
     #[test]
     fn cleanup_rejects_lexical_escape_and_attempt_segments_stay_beneath_root() {
         let (_d1, node_dir, _d3, _coord, node) = test_harness();

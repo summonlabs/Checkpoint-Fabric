@@ -1600,6 +1600,10 @@ impl Coordinator {
                 ckpt.protection
             )));
         }
+        // The lifecycle has to permit retirement before any replica is
+        // deleted. `checkpoint_retire` checks it again, but only after every
+        // node has already removed its copy.
+        ckpt.lifecycle.transition(LifecycleState::Retired)?;
         for loc in &ckpt.durable_locations {
             let req = protocol::NodeCleanupRequest {
                 staging_attempts: Vec::new(),

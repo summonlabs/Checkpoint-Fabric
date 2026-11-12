@@ -74,7 +74,15 @@ impl LifecycleState {
             // the checkpoint itself is not corrupt merely because applying it
             // to one target failed.
             Self::Restoring => matches!(target, Self::Restored | Self::Available | Self::Failed),
-            Self::Restored => matches!(target, Self::Available | Self::Failed),
+            // RESTORED is a restorable state (see `is_restorable`): the same
+            // checkpoint can be restored again, for a later rollback or onto
+            // another target.
+            Self::Restored => {
+                matches!(
+                    target,
+                    Self::RestorePending | Self::Available | Self::Failed
+                )
+            }
             Self::Retired => {
                 matches!(target, Self::RestorePending | Self::Failed)
             }

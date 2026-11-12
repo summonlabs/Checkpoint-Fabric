@@ -260,21 +260,25 @@ fn reconcile_attempt(
                     detail: "restore confirmed committed after restart".into(),
                 });
             }
-            if has_restored {
-                if let Some(checkpoint_id) = a.checkpoint_id {
-                    if let Some(checkpoint) = store.checkpoint_get(&checkpoint_id)? {
-                        if checkpoint.lifecycle == LifecycleState::RestorePending
-                            || checkpoint.lifecycle == LifecycleState::Restoring
-                        {
-                            checkpoint.lifecycle.transition(LifecycleState::Available)?;
-                            store.checkpoint_set_lifecycle(
-                                &checkpoint_id,
-                                LifecycleState::Available,
-                                IntegrityState::Valid,
-                            )?;
-                        }
+            // The restore never committed, whatever it had applied. Its source
+            // checkpoint returns to AVAILABLE: a checkpoint left in
+            // RESTORE_PENDING or RESTORING by an attempt that no longer exists
+            // could never be restored or retired again.
+            if let Some(checkpoint_id) = a.checkpoint_id {
+                if let Some(checkpoint) = store.checkpoint_get(&checkpoint_id)? {
+                    if checkpoint.lifecycle == LifecycleState::RestorePending
+                        || checkpoint.lifecycle == LifecycleState::Restoring
+                    {
+                        checkpoint.lifecycle.transition(LifecycleState::Available)?;
+                        store.checkpoint_set_lifecycle(
+                            &checkpoint_id,
+                            LifecycleState::Available,
+                            IntegrityState::Valid,
+                        )?;
                     }
                 }
+            }
+            if has_restored {
                 store.attempt_finish(
                     &key,
                     "FAILED",
@@ -556,6 +560,47 @@ mod tests {
             .iter()
             .any(|a| a.key == "res-1" && a.state == "failed_cleanup"));
         assert_eq!(store.attempt_get("res-1").unwrap().unwrap().state, "FAILED");
+    }
+
+    #[test]
+    fn restore_interrupted_before_components_returns_checkpoint_to_available() {
+        // A coordinator that stops between entering RESTORE_PENDING/RESTORING
+        // and journaling COMPONENTS_RESTORED leaves no restore progress to
+        // keep. The attempt fails, and the checkpoint must not stay in a
+        // restore state that nothing can ever leave.
+        for interrupted in [LifecycleState::RestorePending, LifecycleState::Restoring] {
+            let (_d, store) = store();
+            let ck = crate::compatibility::sample_checkpoint();
+            store.checkpoint_insert(&ck).unwrap();
+            store
+                .checkpoint_set_lifecycle(&ck.checkpoint_id, interrupted, IntegrityState::Pending)
+                .unwrap();
+            store
+                .attempt_begin(
+                    "res-early",
+                    "restore",
+                    Some(&ck.checkpoint_id),
+                    Some(&ck.workload_id),
+                    "n1",
+                )
+                .unwrap();
+            store
+                .journal_append("restore", "res-early", restore_states::RESERVED, "reserved")
+                .unwrap();
+
+            let out = reconcile(&store, &ctx()).unwrap();
+            assert!(out
+                .actions
+                .iter()
+                .any(|a| a.key == "res-early" && a.state == "failed"));
+            assert_eq!(
+                store.attempt_get("res-early").unwrap().unwrap().state,
+                "FAILED"
+            );
+            let after = store.checkpoint_get(&ck.checkpoint_id).unwrap().unwrap();
+            assert_eq!(after.lifecycle, LifecycleState::Available);
+            assert_eq!(after.integrity_state, IntegrityState::Valid);
+        }
     }
 
     #[test]
